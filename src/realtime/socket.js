@@ -87,6 +87,13 @@ export function initRealtimeServer(httpServer) {
       socket.broadcast.to(room).emit('mindmap:viewport', viewport)
     })
 
+    socket.on('mindmap:nodes:update', (room, node) => {
+      socket.broadcast.to(room).emit('mindmap:nodes:update', node)
+    })
+    socket.on('mindmap:edges:update', (room, edge) => {
+      socket.broadcast.to(room).emit('mindmap:edges:update', edge)
+    })
+
     socket.on('cursor:move', (room, data) => {
       const participants = roomParticipants.get(room)
       if (participants) {
