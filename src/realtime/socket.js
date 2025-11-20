@@ -25,6 +25,11 @@ export function initRealtimeServer(httpServer) {
   })
 
   io.of('/realtime').on('connection', (socket) => {
+    try {
+      const origin = socket.handshake.headers?.origin || 'unknown'
+      const uid = socket.data.user?.id || 'anonymous'
+      console.log(`[socket] connected id=${socket.id} origin=${origin} userId=${uid}`)
+    } catch {}
     socket.on('mindmap:join', async (payload) => {
       try {
         const { mindmapId, shareToken } = payload || {}
@@ -52,16 +57,20 @@ export function initRealtimeServer(httpServer) {
             }
           }
         }
-        if (!room) return
+        if (!room) {
+          console.log(`[join] refused id=${socket.id} token=${shareToken ? 'public' : 'private'} mindmapId=${mindmapId}`)
+          return
+        }
         socket.join(room)
         socket.data.room = room
         socket.emit('mindmap:joined', { room, canEdit })
+        console.log(`[join] room=${room} id=${socket.id} canEdit=${canEdit}`)
         const participants = roomParticipants.get(room) || new Map()
         roomParticipants.set(room, participants)
         const snapshot = Array.from(participants.values())
         socket.emit('presence:state', snapshot)
       } catch (err) {
-        // ignore
+        console.log(`[join:error] id=${socket.id} ${err?.message || err}`)
       }
     })
 
@@ -105,6 +114,7 @@ export function initRealtimeServer(httpServer) {
         cursor: existing.cursor || null,
         active: existing.active || null,
       })
+      console.log(`[presence] announce clientId=${clientId} userId=${userId} name=${name}`)
       socket.broadcast.to(room).emit('presence:announce', { clientId, userId, name, color })
     })
 
@@ -116,6 +126,7 @@ export function initRealtimeServer(httpServer) {
           p.active = data || null
         }
       }
+      console.log(`[presence] active clientId=${socket.id} type=${data?.type || 'none'} id=${data?.id || ''}`)
       socket.broadcast.to(room).emit('presence:active', { clientId: socket.id, active: data || null })
     })
 
@@ -127,6 +138,7 @@ export function initRealtimeServer(httpServer) {
           p.active = null
         }
       }
+      console.log(`[presence] clear clientId=${socket.id}`)
       socket.broadcast.to(room).emit('presence:clear', { clientId: socket.id })
     })
 
@@ -137,6 +149,7 @@ export function initRealtimeServer(httpServer) {
       if (!participants) return
       if (participants.has(socket.id)) {
         participants.delete(socket.id)
+        console.log(`[socket] disconnected id=${socket.id} room=${room}`)
         socket.broadcast.to(room).emit('presence:left', { clientId: socket.id })
       }
     })

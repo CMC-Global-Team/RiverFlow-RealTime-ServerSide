@@ -9,7 +9,7 @@ export const config = {
   backendUrl: process.env.APP_BACKEND_URL || 'https://riverflow-server.onrender.com/api',
   corsOrigins: process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim())
-    : ['http://localhost:8080', 'https://riverflow-server.onrender.com', 'https://river-flow-client.vercel.app'],
+    : ['http://localhost:3000', 'http://localhost:8080', 'https://riverflow-server.onrender.com', 'https://river-flow-client.vercel.app'],
 }
 
 export default config
