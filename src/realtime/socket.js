@@ -31,6 +31,8 @@ export function initRealtimeServer(httpServer) {
       const uid = socket.data.user?.id || 'anonymous'
       console.log(`[socket] connected id=${socket.id} origin=${origin} userId=${uid}`)
     } catch {}
+    const lastSnapshotAtByRoom = new Map()
+
     socket.on('mindmap:join', async (payload) => {
       try {
         const { mindmapId, shareToken } = payload || {}
@@ -46,6 +48,7 @@ export function initRealtimeServer(httpServer) {
               room = `mindmap:${data.id}`
               canEdit = data.publicAccessLevel === 'edit'
               socket.data.mindmapId = data.id
+              socket.data.shareToken = shareToken
             }
           } else if (mindmapId) {
             const token = socket.handshake.auth?.token
@@ -57,6 +60,7 @@ export function initRealtimeServer(httpServer) {
               room = `mindmap:${data.id}`
               canEdit = true
               socket.data.mindmapId = data.id
+              socket.data.shareToken = null
             }
           }
         }
@@ -93,6 +97,37 @@ export function initRealtimeServer(httpServer) {
       }
     }
 
+    const maybeGetSnapshot = async () => {
+      try {
+        const room = socket.data.room
+        if (!room) return null
+        const lastAt = lastSnapshotAtByRoom.get(room) || 0
+        const now = Date.now()
+        if (now - lastAt < 10000) return null
+        const mindmapId = socket.data.mindmapId
+        if (!mindmapId) return null
+        const shareToken = socket.data.shareToken
+        let res
+        if (shareToken) {
+          res = await fetch(`${config.backendUrl}/mindmaps/public/${shareToken}`)
+        } else {
+          const token = socket.data.token
+          const headers = token ? { Authorization: `Bearer ${token}` } : {}
+          res = await fetch(`${config.backendUrl}/mindmaps/${mindmapId}`, { headers })
+        }
+        if (!res?.ok) return null
+        const data = await res.json()
+        lastSnapshotAtByRoom.set(room, now)
+        return {
+          nodes: data?.nodes || [],
+          edges: data?.edges || [],
+          viewport: data?.viewport || null,
+        }
+      } catch (_) {
+        return null
+      }
+    }
+
     const logHistory = async (action, changes, snapshot = null, status = 'active') => {
       try {
         if (!config.backendUrl) return
@@ -105,10 +140,11 @@ export function initRealtimeServer(httpServer) {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         }
+        const snap = snapshot || (await maybeGetSnapshot())
         const body = {
           action,
           changes: normalizeChanges(changes),
-          snapshot: normalizeChanges(snapshot),
+          snapshot: normalizeChanges(snap),
           metadata: {
             ip: socket.handshake.address || null,
             userAgent: socket.handshake.headers['user-agent'] || null,
@@ -124,11 +160,39 @@ export function initRealtimeServer(httpServer) {
         if (!res.ok) {
           const txt = await res.text()
           console.log(`[history:log:error] id=${socket.id} action=${action} code=${res.status} msg=${txt}`)
+          socket.emit('history:log:error', { mindmapId, action, code: res.status })
+        }
+        if (res.ok) {
+          const entry = {
+            id: null,
+            mindmapId,
+            mysqlUserId: socket.data.user?.id || null,
+            action,
+            changes: body.changes,
+            snapshot: body.snapshot,
+            metadata: body.metadata,
+            createdAt: new Date().toISOString(),
+            status,
+          }
+          const room = socket.data.room
+          if (room) io.of('/realtime').to(room).emit('history:log', entry)
         }
       } catch (e) {
         console.log(`[history:log:error] id=${socket.id} action=${action} msg=${e?.message || e}`)
+        socket.emit('history:log:error', { mindmapId: socket.data.mindmapId || null, action })
       }
     }
+
+    socket.on('history:restore', (room, payload) => {
+      try {
+        const snapshot = payload?.snapshot || null
+        const historyId = payload?.historyId || null
+        io.of('/realtime').to(room).emit('history:restore', { historyId, snapshot })
+        logHistory('restore', { targetHistoryId: historyId }, snapshot)
+      } catch (e) {
+        console.log(`[history:restore:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
 
     socket.on('mindmap:nodes:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:nodes:change', changes)
