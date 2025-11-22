@@ -78,6 +78,21 @@ export function initRealtimeServer(httpServer) {
       }
     })
 
+    const normalizeChanges = (c) => {
+      try {
+        if (Array.isArray(c)) {
+          return { items: c, count: c.length }
+        }
+        if (c && typeof c === 'object') {
+          return c
+        }
+        if (c == null) return undefined
+        return { value: c }
+      } catch (_) {
+        return undefined
+      }
+    }
+
     const logHistory = async (action, changes, snapshot = null, status = 'active') => {
       try {
         if (!config.backendUrl) return
@@ -92,8 +107,8 @@ export function initRealtimeServer(httpServer) {
         }
         const body = {
           action,
-          changes,
-          snapshot,
+          changes: normalizeChanges(changes),
+          snapshot: normalizeChanges(snapshot),
           metadata: {
             ip: socket.handshake.address || null,
             userAgent: socket.handshake.headers['user-agent'] || null,
