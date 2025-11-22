@@ -128,11 +128,15 @@ export function initRealtimeServer(httpServer) {
       }
     }
 
+    const lastLogAtByRoomAction = new Map()
+
     const logHistory = async (action, changes, snapshot = null, status = 'active') => {
       try {
         if (!config.backendUrl) return
         if (!socket.data.room) return
         if (!socket.data.canEdit) return
+        const allowed = String(action).startsWith('node_') || String(action).startsWith('edge_') || action === 'delete' || action === 'restore'
+        if (!allowed) return
         const mindmapId = (socket.data.mindmapId) || (String(socket.data.room).split(':')[1])
         if (!mindmapId) return
         const token = socket.data.token
@@ -140,6 +144,11 @@ export function initRealtimeServer(httpServer) {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         }
+        const key = `${socket.data.room}:${action}`
+        const now = Date.now()
+        const lastAt = lastLogAtByRoomAction.get(key) || 0
+        const minInterval = (action === 'node_update' || action === 'edge_update') ? 1000 : 0
+        if (minInterval > 0 && now - lastAt < minInterval) return
         const snap = snapshot || (await maybeGetSnapshot())
         const body = {
           action,
@@ -163,6 +172,7 @@ export function initRealtimeServer(httpServer) {
           socket.emit('history:log:error', { mindmapId, action, code: res.status })
         }
         if (res.ok) {
+          lastLogAtByRoomAction.set(key, now)
           const entry = {
             id: null,
             mindmapId,
@@ -208,7 +218,6 @@ export function initRealtimeServer(httpServer) {
     })
     socket.on('mindmap:viewport', (room, viewport) => {
       socket.broadcast.to(room).emit('mindmap:viewport', viewport)
-      logHistory('viewport_change', viewport)
     })
 
     socket.on('mindmap:nodes:update', (room, node) => {
