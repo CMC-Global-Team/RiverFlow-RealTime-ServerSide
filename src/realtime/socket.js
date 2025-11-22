@@ -103,7 +103,7 @@ export function initRealtimeServer(httpServer) {
         if (!room) return null
         const lastAt = lastSnapshotAtByRoom.get(room) || 0
         const now = Date.now()
-        if (now - lastAt < 10000) return null
+        if (now - lastAt < 1000) return null
         const mindmapId = socket.data.mindmapId
         if (!mindmapId) return null
         const shareToken = socket.data.shareToken
