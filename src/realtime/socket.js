@@ -204,9 +204,33 @@ export function initRealtimeServer(httpServer) {
       }
     })
 
+    const dragStateByRoom = new Map()
+
     socket.on('mindmap:nodes:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:nodes:change', changes)
-      logHistory('node_update', changes)
+      try {
+        if (!room || !Array.isArray(changes)) return
+        const trackers = dragStateByRoom.get(room) || new Map()
+        dragStateByRoom.set(room, trackers)
+        for (const ch of changes) {
+          const isPos = ch && ch.type === 'position'
+          const id = ch && ch.id
+          const pos = ch && ch.position
+          const dragging = ch && Object.prototype.hasOwnProperty.call(ch, 'dragging') ? ch.dragging === true : undefined
+          if (!isPos || !id || !pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue
+          const prev = trackers.get(id) || { start: null, last: null }
+          if (!prev.start) prev.start = { x: pos.x, y: pos.y }
+          prev.last = { x: pos.x, y: pos.y }
+          trackers.set(id, prev)
+          if (dragging === false) {
+            const t = trackers.get(id)
+            if (t && t.start && t.last && (t.start.x !== t.last.x || t.start.y !== t.last.y)) {
+              logHistory('node_update', { id, from: t.start, to: t.last })
+            }
+            trackers.delete(id)
+          }
+        }
+      } catch (_) {}
     })
     socket.on('mindmap:edges:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:edges:change', changes)
