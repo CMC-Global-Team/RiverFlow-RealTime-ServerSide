@@ -326,6 +326,7 @@ export function initRealtimeServer(httpServer) {
           userId: socket.data.user?.id || null,
           name: (info && info.name) || 'Anonymous',
           color: (info && info.color) || '#3b82f6',
+          avatar: (info && info.avatar) || null,
           message: trimmed,
           createdAt: new Date().toISOString(),
         }
