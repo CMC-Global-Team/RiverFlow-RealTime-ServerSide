@@ -271,17 +271,19 @@ export function initRealtimeServer(httpServer) {
       const userId = socket.data.user?.id || info?.userId || null
       const name = info?.name || ''
       const color = info?.color || '#3b82f6'
+      const avatar = info?.avatar || null
       const existing = participants.get(clientId) || {}
       participants.set(clientId, {
         clientId,
         userId,
         name,
         color,
+        avatar,
         cursor: existing.cursor || null,
         active: existing.active || null,
       })
       console.log(`[presence] announce clientId=${clientId} userId=${userId} name=${name}`)
-      socket.broadcast.to(room).emit('presence:announce', { clientId, userId, name, color })
+      socket.broadcast.to(room).emit('presence:announce', { clientId, userId, name, color, avatar })
     })
 
     socket.on('presence:active', (room, data) => {
@@ -330,6 +332,29 @@ export function initRealtimeServer(httpServer) {
         io.of('/realtime').to(r).emit('chat:message', msg)
       } catch (e) {
         console.log(`[chat:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
+    socket.on('chat:typing', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+        const participants = roomParticipants.get(r)
+        const info = participants ? participants.get(socket.id) : null
+        const isTyping = !!(payload && payload.isTyping === true)
+        const data = {
+          room: r,
+          clientId: socket.id,
+          userId: socket.data.user?.id || null,
+          name: (info && info.name) || 'Anonymous',
+          color: (info && info.color) || '#3b82f6',
+          avatar: (info && info.avatar) || null,
+          isTyping,
+          at: Date.now(),
+        }
+        io.of('/realtime').to(r).emit('chat:typing', data)
+      } catch (e) {
+        console.log(`[chat:typing:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
