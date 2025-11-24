@@ -308,6 +308,31 @@ export function initRealtimeServer(httpServer) {
       socket.broadcast.to(room).emit('presence:clear', { clientId: socket.id })
     })
 
+    socket.on('chat:message', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+        const participants = roomParticipants.get(r)
+        const info = participants ? participants.get(socket.id) : null
+        const text = (payload && (payload.text || payload.message)) || ''
+        const trimmed = String(text).trim()
+        if (!trimmed) return
+        const msg = {
+          id: `${socket.id}-${Date.now()}`,
+          room: r,
+          clientId: socket.id,
+          userId: socket.data.user?.id || null,
+          name: (info && info.name) || 'Anonymous',
+          color: (info && info.color) || '#3b82f6',
+          message: trimmed,
+          createdAt: new Date().toISOString(),
+        }
+        io.of('/realtime').to(r).emit('chat:message', msg)
+      } catch (e) {
+        console.log(`[chat:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
     socket.on('disconnect', () => {
       const room = socket.data.room
       if (!room) return
