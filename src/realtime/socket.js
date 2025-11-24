@@ -371,6 +371,8 @@ export function initRealtimeServer(httpServer) {
       }
     })
   })
+
+  globalThis.realtimeIO = io
 }
 
 export default initRealtimeServer
