@@ -33,4 +33,28 @@ app.post('/realtime/mindmap/event', async (req, res) => {
   }
 })
 
+app.post('/notify/permission-change', async (req, res) => {
+  try {
+    const { mindmapId, eventType, data } = req.body || {}
+    const io = globalThis.realtimeIO
+    if (!io) return res.status(500).json({ ok: false, error: 'io not ready' })
+    if (!eventType || !mindmapId) return res.status(400).json({ ok: false, error: 'missing eventType or mindmapId' })
+
+    const room = `mindmap:${mindmapId}`
+
+    // Broadcast different events based on event type
+    if (eventType === 'collaborator_role_changed') {
+      io.of('/realtime').to(room).emit('permission:collaborator:changed', data)
+    } else if (eventType === 'collaborator_removed') {
+      io.of('/realtime').to(room).emit('permission:collaborator:removed', data)
+    } else if (eventType === 'public_access_changed') {
+      io.of('/realtime').to(room).emit('permission:public:changed', data)
+    }
+
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e && e.message || e) })
+  }
+})
+
 export default app
