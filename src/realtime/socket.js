@@ -1,4 +1,6 @@
 import { Server } from 'socket.io'
+import { createAdapter } from '@socket.io/redis-adapter'
+import Redis from 'ioredis'
 import jwt from 'jsonwebtoken'
 import { config } from '../config/app.config.js'
 
@@ -7,6 +9,25 @@ export function initRealtimeServer(httpServer) {
     cors: { origin: config.corsOrigins, credentials: true },
     path: '/socket.io',
   })
+
+  // Setup Redis adapter for horizontal scaling
+  if (config.useRedis && config.redisUrl) {
+    try {
+      const pubClient = new Redis(config.redisUrl)
+      const subClient = pubClient.duplicate()
+
+      pubClient.on('error', (err) => console.error('[Socket.IO] Redis Pub Client Error:', err.message))
+      subClient.on('error', (err) => console.error('[Socket.IO] Redis Sub Client Error:', err.message))
+      pubClient.on('connect', () => console.log('[Socket.IO] Redis adapter connected.'))
+
+      io.adapter(createAdapter(pubClient, subClient))
+      console.log('[Socket.IO] Redis adapter enabled for horizontal scaling.')
+    } catch (err) {
+      console.warn('[Socket.IO] Redis adapter failed, using in-memory adapter:', err.message)
+    }
+  } else {
+    console.log('[Socket.IO] Using in-memory adapter (no Redis configured).')
+  }
 
   const roomParticipants = new Map()
 

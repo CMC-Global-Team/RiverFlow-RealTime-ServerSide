@@ -10,6 +10,8 @@ export const config = {
   corsOrigins: process.env.CORS_ORIGINS
     ? process.env.CORS_ORIGINS.split(',').map((o) => o.trim())
     : ['http://localhost:3000', 'http://localhost:8080', 'https://river-flow.id.vn', 'https://river-flow-client.vercel.app'],
+  redisUrl: process.env.REDIS_URL || null,
+  useRedis: process.env.USE_REDIS === 'true' || !!process.env.REDIS_URL,
 }
 
 export default config

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: riverflow-realtime
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: CORS_ORIGINS
+        value: https://river-flow.id.vn,https://river-flow-client.vercel.app
+      - key: APP_BACKEND_URL
+        value: https://river-flow.id.vn/api
+      - key: JWT_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false  # Set manually with Upstash URL
