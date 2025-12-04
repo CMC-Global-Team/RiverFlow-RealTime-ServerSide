@@ -47,31 +47,37 @@ const start = async () => {
 
   // Initialize and start the buffering utility (Socket.IO-based)
   const bufferInstance = new DataBuffer(server, {
-    // You can tune these options as needed
+    // Tuning options
     flushIntervalMs: 1000,
     maxBufferSize: 5000,
     maxChunkSize: 500,
-    useRedis: true, // set true if you actually want Redis
+    // Redis config from environment
+    useRedis: config.useRedis,
+    redisUrl: config.redisUrl,
     socketOptions: {
       cors: {
-        origin: '*',
+        origin: config.corsOrigins,
         methods: ['GET', 'POST', 'PUT', 'DELETE'],
       },
     },
   });
 
-  // If you need Redis immediately in server.js, await the public getter:
-  try {
-    const redisClient = await bufferInstance.redisClient();
-    server.OTMZ_Buffer_instance_redis = redisClient; // expose on server if you need it elsewhere
-    console.log('Redis client connected.');
-  } catch (err) {
-    console.error('Redis client failed to connect:', err);
+  // If Redis is enabled, try to get the client for other uses
+  if (config.useRedis) {
+    try {
+      const redisClient = await bufferInstance.redisClient();
+      server.OTMZ_Buffer_instance_redis = redisClient;
+      console.log('[Server] Redis buffer client ready.');
+    } catch (err) {
+      console.warn('[Server] Redis buffer client unavailable, using in-memory:', err.message);
+    }
+  } else {
+    console.log('[Server] Using in-memory buffer (no Redis configured).');
   }
 
   // Useful diagnostics
-  console.log(`Buffer length: ${bufferInstance.getBuffer()?.length ?? 0}`);
-  console.log('Buffering started.');
+  console.log(`[Server] Buffer length: ${bufferInstance.getBufferLength()}`);
+  console.log('[Server] Buffering started.');
 
   const PORT = config.port;
   server.listen(PORT, () => {

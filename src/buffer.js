@@ -2,7 +2,7 @@
 // src/buffer.js (ESM)
 
 import { Server } from 'socket.io';
-import redis from 'redis';
+import Redis from 'ioredis';
 
 class Buffer {
   /**
@@ -12,6 +12,7 @@ class Buffer {
    * @param {number} [options.maxBufferSize=5000]
    * @param {number} [options.maxChunkSize=500]
    * @param {boolean} [options.useRedis=false]
+   * @param {string|null} [options.redisUrl=null]
    * @param {object} [options.socketOptions]
    */
   constructor(server, options = {}) {
@@ -20,6 +21,7 @@ class Buffer {
       maxBufferSize = 5000,
       maxChunkSize = 500,
       useRedis = false,
+      redisUrl = null,
       socketOptions = {
         cors: {
           origin: '*',
@@ -37,13 +39,18 @@ class Buffer {
     this._isFlushing = false;
     this.redisClientInstance = null;
     this.useRedis = useRedis;
+    this.redisUrl = redisUrl;
+
+    // Redis buffer key for persistence
+    this.redisBufferKey = 'riverflow:realtime:buffer';
 
     this._wireSocketLifecycle();
     this.startBuffering();
 
     if (this.useRedis) {
       this._initRedis().catch((err) => {
-        console.error('[Buffer] Redis init failed:', err);
+        console.error('[Buffer] Redis init failed, falling back to in-memory:', err.message);
+        this.useRedis = false;
       });
     }
   }
@@ -74,14 +81,27 @@ class Buffer {
 
   /**
    * Add data to buffer. Optionally target a room/event.
+   * Uses Redis if available, otherwise in-memory.
    * @param {any} data
    * @param {{room?: string, event?: string}} [opts]
    */
-  addToBuffer(data, opts = {}) {
+  async addToBuffer(data, opts = {}) {
     const { room = null, event = 'bufferedData' } = opts;
-    const item = { payload: data, room, event };
+    const item = { payload: data, room, event, timestamp: Date.now() };
 
-    // Backpressure: drop oldest if exceeding max
+    if (this.useRedis && this.redisClientInstance) {
+      try {
+        // Use Redis list for buffer storage
+        await this.redisClientInstance.rpush(this.redisBufferKey, JSON.stringify(item));
+        // Trim to max size
+        await this.redisClientInstance.ltrim(this.redisBufferKey, -this.maxBufferSize, -1);
+        return;
+      } catch (err) {
+        console.error('[Buffer] Redis addToBuffer failed, using in-memory:', err.message);
+      }
+    }
+
+    // Fallback: in-memory buffer
     if (this.buffer.length >= this.maxBufferSize) {
       this.buffer.shift();
     }
@@ -91,18 +111,43 @@ class Buffer {
   getBuffer() {
     return [...this.buffer];
   }
+
   getBufferLength() {
     return this.buffer.length;
   }
 
   async _flush() {
     if (this._isFlushing) return;
-    if (this.buffer.length === 0) return;
     this._isFlushing = true;
 
     try {
-      const toSend = this.buffer;
-      this.buffer = [];
+      let toSend = [];
+
+      if (this.useRedis && this.redisClientInstance) {
+        try {
+          // Get all items from Redis and clear
+          const items = await this.redisClientInstance.lrange(this.redisBufferKey, 0, -1);
+          if (items.length > 0) {
+            await this.redisClientInstance.del(this.redisBufferKey);
+            toSend = items.map(item => {
+              try {
+                return JSON.parse(item);
+              } catch {
+                return null;
+              }
+            }).filter(Boolean);
+          }
+        } catch (err) {
+          console.error('[Buffer] Redis flush failed, using in-memory:', err.message);
+          toSend = this.buffer;
+          this.buffer = [];
+        }
+      } else {
+        toSend = this.buffer;
+        this.buffer = [];
+      }
+
+      if (toSend.length === 0) return;
 
       const groups = new Map(); // key: `${room ?? ''}::${event ?? 'bufferedData'}`
       for (const { payload, room, event } of toSend) {
@@ -131,16 +176,55 @@ class Buffer {
     }
   }
 
-  /** Initialize a singleton Redis client */
+  /** Initialize Redis client with ioredis (better TLS and reconnection support) */
   async _initRedis() {
     if (this.redisClientInstance) return this.redisClientInstance;
 
-    const client = redis.createClient();
+    const redisOptions = this.redisUrl
+      ? this.redisUrl
+      : {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: parseInt(process.env.REDIS_PORT || '6379', 10),
+        password: process.env.REDIS_PASSWORD || undefined,
+        // TLS config for Render.com (uses rediss://)
+        ...(this.redisUrl?.startsWith('rediss://') ? { tls: {} } : {}),
+      };
+
+    const client = new Redis(redisOptions);
+
     client.on('error', (err) => {
-      console.error('[Buffer] Redis Client Error:', err);
+      console.error('[Buffer] Redis Client Error:', err.message);
     });
 
-    await client.connect();
+    client.on('connect', () => {
+      console.log('[Buffer] Redis client connected.');
+    });
+
+    client.on('ready', () => {
+      console.log('[Buffer] Redis client ready.');
+    });
+
+    client.on('reconnecting', () => {
+      console.log('[Buffer] Redis client reconnecting...');
+    });
+
+    // Wait for connection with timeout
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Redis connection timeout'));
+      }, 10000);
+
+      client.once('ready', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+
+      client.once('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+
     this.redisClientInstance = client;
     return client;
   }
@@ -157,8 +241,9 @@ class Buffer {
     if (this.redisClientInstance) {
       try {
         await this.redisClientInstance.quit();
+        console.log('[Buffer] Redis client closed.');
       } catch (err) {
-        console.error('[Buffer] Redis quit error:', err);
+        console.error('[Buffer] Redis quit error:', err.message);
       } finally {
         this.redisClientInstance = null;
       }
