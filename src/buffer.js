@@ -1,36 +1,31 @@
 
 // src/buffer.js (ESM)
+// Buffer utility that uses an existing Socket.IO instance (no duplicate server)
 
-import { Server } from 'socket.io';
 import Redis from 'ioredis';
 
 class Buffer {
   /**
-   * @param {import('http').Server} server - Node HTTP server instance
    * @param {object} [options]
    * @param {number} [options.flushIntervalMs=1000]
    * @param {number} [options.maxBufferSize=5000]
    * @param {number} [options.maxChunkSize=500]
    * @param {boolean} [options.useRedis=false]
    * @param {string|null} [options.redisUrl=null]
-   * @param {object} [options.socketOptions]
+   * @param {import('socket.io').Server} [options.io=null] - Existing Socket.IO instance
    */
-  constructor(server, options = {}) {
+  constructor(options = {}) {
     const {
       flushIntervalMs = 1000,
       maxBufferSize = 5000,
       maxChunkSize = 500,
       useRedis = false,
       redisUrl = null,
-      socketOptions = {
-        cors: {
-          origin: '*',
-          methods: ['GET', 'POST', 'PUT', 'DELETE'],
-        },
-      },
+      io = null,
     } = options;
 
-    this.io = new Server(server, socketOptions);
+    // Use existing io instance instead of creating a new one
+    this.io = io;
     this.buffer = [];
     this.flushIntervalMs = flushIntervalMs;
     this.maxBufferSize = maxBufferSize;
@@ -44,7 +39,6 @@ class Buffer {
     // Redis buffer key for persistence
     this.redisBufferKey = 'riverflow:realtime:buffer';
 
-    this._wireSocketLifecycle();
     this.startBuffering();
 
     if (this.useRedis) {
@@ -53,18 +47,6 @@ class Buffer {
         this.useRedis = false;
       });
     }
-  }
-
-  _wireSocketLifecycle() {
-    this.io.on('connection', (socket) => {
-      if (socket.handshake.query?.room) {
-        socket.join(socket.handshake.query.room);
-      }
-      socket.on('disconnect', () => {
-        // Example:
-        // if (this.io.engine.clientsCount === 0) this.stopBuffering();
-      });
-    });
   }
 
   startBuffering() {
@@ -118,6 +100,7 @@ class Buffer {
 
   async _flush() {
     if (this._isFlushing) return;
+    if (!this.io) return; // No io instance, skip flush
     this._isFlushing = true;
 
     try {
@@ -180,17 +163,7 @@ class Buffer {
   async _initRedis() {
     if (this.redisClientInstance) return this.redisClientInstance;
 
-    const redisOptions = this.redisUrl
-      ? this.redisUrl
-      : {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT || '6379', 10),
-        password: process.env.REDIS_PASSWORD || undefined,
-        // TLS config for Render.com (uses rediss://)
-        ...(this.redisUrl?.startsWith('rediss://') ? { tls: {} } : {}),
-      };
-
-    const client = new Redis(redisOptions);
+    const client = new Redis(this.redisUrl);
 
     client.on('error', (err) => {
       console.error('[Buffer] Redis Client Error:', err.message);
@@ -235,6 +208,11 @@ class Buffer {
     return this._initRedis();
   }
 
+  /** Set the io instance after initialization */
+  setIO(io) {
+    this.io = io;
+  }
+
   /** Graceful shutdown: stop timers and close Redis */
   async close() {
     this.stopBuffering();
@@ -248,7 +226,6 @@ class Buffer {
         this.redisClientInstance = null;
       }
     }
-    // Optionally: await this.io.close();
   }
 }
 

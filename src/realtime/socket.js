@@ -410,6 +410,7 @@ export function initRealtimeServer(httpServer) {
   })
 
   globalThis.realtimeIO = io
+  return io  // Return the io instance for sharing with Buffer
 }
 
 export default initRealtimeServer

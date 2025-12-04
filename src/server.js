@@ -42,11 +42,11 @@ const start = async () => {
   // Create ONE HTTP server wrapping the APP
   const server = http.createServer(APP);
 
-  // Initialize Socket.IO or other realtime integrations on this server
-  initRealtimeServer(server);
+  // Initialize Socket.IO - returns the io instance
+  const io = initRealtimeServer(server);
 
-  // Initialize and start the buffering utility (Socket.IO-based)
-  const bufferInstance = new DataBuffer(server, {
+  // Initialize the buffering utility (uses the same io instance, no duplicate server)
+  const bufferInstance = new DataBuffer({
     // Tuning options
     flushIntervalMs: 1000,
     maxBufferSize: 5000,
@@ -54,12 +54,8 @@ const start = async () => {
     // Redis config from environment
     useRedis: config.useRedis,
     redisUrl: config.redisUrl,
-    socketOptions: {
-      cors: {
-        origin: config.corsOrigins,
-        methods: ['GET', 'POST', 'PUT', 'DELETE'],
-      },
-    },
+    // Share the existing io instance
+    io: io,
   });
 
   // If Redis is enabled, try to get the client for other uses
