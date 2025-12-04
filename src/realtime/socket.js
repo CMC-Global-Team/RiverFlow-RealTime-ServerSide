@@ -30,7 +30,7 @@ export function initRealtimeServer(httpServer) {
       const origin = socket.handshake.headers?.origin || 'unknown'
       const uid = socket.data.user?.id || 'anonymous'
       console.log(`[socket] connected id=${socket.id} origin=${origin} userId=${uid}`)
-    } catch {}
+    } catch { }
     const lastSnapshotAtByRoom = new Map()
 
     socket.on('mindmap:join', async (payload) => {
@@ -39,6 +39,22 @@ export function initRealtimeServer(httpServer) {
         let room = null
         let canEdit = false
         let ok = false
+
+        // Support for user-based rooms (for AI streaming)
+        if (mindmapId && mindmapId.startsWith('user:')) {
+          // User rooms don't need backend validation
+          // They're used for AI streaming events
+          room = mindmapId
+          canEdit = false // User rooms are read-only for AI events
+          ok = true
+          socket.join(room)
+          socket.data.room = room
+          socket.data.canEdit = canEdit
+          socket.emit('mindmap:joined', { room, canEdit })
+          console.log(`[join] user-room=${room} id=${socket.id} (AI streaming)`)
+          return
+        }
+
         if (config.backendUrl) {
           if (shareToken) {
             const res = await fetch(`${config.backendUrl}/mindmaps/public/${shareToken}`)
@@ -230,7 +246,7 @@ export function initRealtimeServer(httpServer) {
             trackers.delete(id)
           }
         }
-      } catch (_) {}
+      } catch (_) { }
     })
     socket.on('mindmap:edges:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:edges:change', changes)
