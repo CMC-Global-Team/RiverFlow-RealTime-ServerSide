@@ -396,6 +396,61 @@ export function initRealtimeServer(httpServer) {
       }
     })
 
+    // Handle auto-save mode sync - broadcast to all clients in room
+    socket.on('autosave:toggle', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+        const enabled = payload?.enabled === true
+        io.of('/realtime').to(r).emit('autosave:sync', {
+          enabled,
+          clientId: socket.id,
+          userId: socket.data.user?.id || null,
+          at: Date.now(),
+        })
+        console.log(`[autosave] room=${r} enabled=${enabled} by clientId=${socket.id}`)
+      } catch (e) {
+        console.log(`[autosave:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
+    // Handle undo sync - broadcast to other clients
+    socket.on('undo:performed', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+        socket.broadcast.to(r).emit('undo:performed', {
+          clientId: socket.id,
+          userId: socket.data.user?.id || null,
+          historyId: payload?.historyId || null,
+          cursor: payload?.cursor,
+          at: Date.now(),
+        })
+        console.log(`[undo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
+      } catch (e) {
+        console.log(`[undo:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
+    // Handle redo sync - broadcast to other clients
+    socket.on('redo:performed', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+        socket.broadcast.to(r).emit('redo:performed', {
+          clientId: socket.id,
+          userId: socket.data.user?.id || null,
+          historyId: payload?.historyId || null,
+          cursor: payload?.cursor,
+          at: Date.now(),
+        })
+        console.log(`[redo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
+      } catch (e) {
+        console.log(`[redo:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
+
     socket.on('disconnect', () => {
       const room = socket.data.room
       if (!room) return
