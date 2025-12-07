@@ -424,6 +424,7 @@ export function initRealtimeServer(httpServer) {
           userId: socket.data.user?.id || null,
           historyId: payload?.historyId || null,
           cursor: payload?.cursor,
+          snapshot: payload?.snapshot,
           at: Date.now(),
         })
         console.log(`[undo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
@@ -442,6 +443,7 @@ export function initRealtimeServer(httpServer) {
           userId: socket.data.user?.id || null,
           historyId: payload?.historyId || null,
           cursor: payload?.cursor,
+          snapshot: payload?.snapshot,
           at: Date.now(),
         })
         console.log(`[redo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
