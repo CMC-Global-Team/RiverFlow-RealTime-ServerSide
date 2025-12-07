@@ -31,6 +31,11 @@ export function initRealtimeServer(httpServer) {
 
   const roomParticipants = new Map()
 
+  // History storage per room for undo/redo
+  // Each room has { past: [], future: [], currentSnapshot: null }
+  const roomHistory = new Map()
+  const MAX_HISTORY_SIZE = 50
+
   io.of('/realtime').use((socket, next) => {
     try {
       const token = socket.handshake.auth?.token || socket.handshake.headers['authorization']?.replace('Bearer ', '')
@@ -414,7 +419,131 @@ export function initRealtimeServer(httpServer) {
       }
     })
 
-    // Handle undo sync - broadcast to other clients
+    // ===== REALTIME UNDO/REDO SYSTEM =====
+
+    // Helper: Get or create history for a room
+    const getOrCreateRoomHistory = (room) => {
+      if (!roomHistory.has(room)) {
+        roomHistory.set(room, { past: [], future: [], currentSnapshot: null })
+      }
+      return roomHistory.get(room)
+    }
+
+    // Handle snapshot recording before changes
+    socket.on('mindmap:snapshot', (room, payload) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+
+        const history = getOrCreateRoomHistory(r)
+        const snapshot = payload?.snapshot
+
+        if (!snapshot) return
+
+        // Save current state to past before applying new change
+        if (history.currentSnapshot) {
+          history.past.push(history.currentSnapshot)
+          // Limit history size
+          if (history.past.length > MAX_HISTORY_SIZE) {
+            history.past.shift()
+          }
+        }
+
+        // Clear future (new action invalidates redo)
+        history.future = []
+
+        // Update current snapshot
+        history.currentSnapshot = snapshot
+
+        // Broadcast canUndo/canRedo state to all clients
+        io.of('/realtime').to(r).emit('history:state', {
+          canUndo: history.past.length > 0,
+          canRedo: history.future.length > 0,
+        })
+
+        console.log(`[snapshot] room=${r} past=${history.past.length} future=${history.future.length}`)
+      } catch (e) {
+        console.log(`[snapshot:error] id=${socket.id} ${e?.message || e}`)
+      }
+    })
+
+    // Handle undo request
+    socket.on('undo:request', (room) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+
+        const history = getOrCreateRoomHistory(r)
+
+        if (history.past.length === 0) {
+          socket.emit('undo:result', { success: false, reason: 'Nothing to undo' })
+          return
+        }
+
+        // Push current to future
+        if (history.currentSnapshot) {
+          history.future.push(history.currentSnapshot)
+        }
+
+        // Pop from past
+        const previousSnapshot = history.past.pop()
+        history.currentSnapshot = previousSnapshot
+
+        // Broadcast restored state to ALL clients in room
+        io.of('/realtime').to(r).emit('undo:result', {
+          success: true,
+          snapshot: previousSnapshot,
+          canUndo: history.past.length > 0,
+          canRedo: history.future.length > 0,
+          clientId: socket.id,
+        })
+
+        console.log(`[undo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
+      } catch (e) {
+        console.log(`[undo:error] id=${socket.id} ${e?.message || e}`)
+        socket.emit('undo:result', { success: false, reason: e?.message || 'Undo failed' })
+      }
+    })
+
+    // Handle redo request
+    socket.on('redo:request', (room) => {
+      try {
+        const r = room || socket.data.room
+        if (!r) return
+
+        const history = getOrCreateRoomHistory(r)
+
+        if (history.future.length === 0) {
+          socket.emit('redo:result', { success: false, reason: 'Nothing to redo' })
+          return
+        }
+
+        // Push current to past
+        if (history.currentSnapshot) {
+          history.past.push(history.currentSnapshot)
+        }
+
+        // Pop from future
+        const nextSnapshot = history.future.pop()
+        history.currentSnapshot = nextSnapshot
+
+        // Broadcast restored state to ALL clients in room
+        io.of('/realtime').to(r).emit('redo:result', {
+          success: true,
+          snapshot: nextSnapshot,
+          canUndo: history.past.length > 0,
+          canRedo: history.future.length > 0,
+          clientId: socket.id,
+        })
+
+        console.log(`[redo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
+      } catch (e) {
+        console.log(`[redo:error] id=${socket.id} ${e?.message || e}`)
+        socket.emit('redo:result', { success: false, reason: e?.message || 'Redo failed' })
+      }
+    })
+
+    // Legacy: keep undo:performed and redo:performed for backwards compatibility
     socket.on('undo:performed', (room, payload) => {
       try {
         const r = room || socket.data.room
@@ -422,18 +551,14 @@ export function initRealtimeServer(httpServer) {
         socket.broadcast.to(r).emit('undo:performed', {
           clientId: socket.id,
           userId: socket.data.user?.id || null,
-          historyId: payload?.historyId || null,
-          cursor: payload?.cursor,
           snapshot: payload?.snapshot,
           at: Date.now(),
         })
-        console.log(`[undo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
       } catch (e) {
-        console.log(`[undo:error] id=${socket.id} ${e?.message || e}`)
+        console.log(`[undo:performed:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
-    // Handle redo sync - broadcast to other clients
     socket.on('redo:performed', (room, payload) => {
       try {
         const r = room || socket.data.room
@@ -441,14 +566,11 @@ export function initRealtimeServer(httpServer) {
         socket.broadcast.to(r).emit('redo:performed', {
           clientId: socket.id,
           userId: socket.data.user?.id || null,
-          historyId: payload?.historyId || null,
-          cursor: payload?.cursor,
           snapshot: payload?.snapshot,
           at: Date.now(),
         })
-        console.log(`[redo] room=${r} cursor=${payload?.cursor} by clientId=${socket.id}`)
       } catch (e) {
-        console.log(`[redo:error] id=${socket.id} ${e?.message || e}`)
+        console.log(`[redo:performed:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
