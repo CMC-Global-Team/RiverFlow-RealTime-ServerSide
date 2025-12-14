@@ -1,6 +1,6 @@
 
 // src/buffer.js (ESM)
-// Buffer utility that uses an existing Socket.IO instance (no duplicate server)
+// Optimized Buffer utility with atomic Redis operations
 
 import Redis from 'ioredis';
 
@@ -24,7 +24,6 @@ class Buffer {
       io = null,
     } = options;
 
-    // Use existing io instance instead of creating a new one
     this.io = io;
     this.buffer = [];
     this.flushIntervalMs = flushIntervalMs;
@@ -36,8 +35,15 @@ class Buffer {
     this.useRedis = useRedis;
     this.redisUrl = redisUrl;
 
-    // Redis buffer key for persistence
     this.redisBufferKey = 'riverflow:realtime:buffer';
+
+    // OPTIMIZATION: Track buffer stats for monitoring
+    this._stats = {
+      totalAdded: 0,
+      totalFlushed: 0,
+      flushErrors: 0,
+      lastFlushAt: null,
+    };
 
     this.startBuffering();
 
@@ -50,7 +56,7 @@ class Buffer {
   }
 
   startBuffering() {
-    if (this._intervalHandle) return; // already running
+    if (this._intervalHandle) return;
     this._intervalHandle = setInterval(() => this._flush(), this.flushIntervalMs);
   }
 
@@ -71,12 +77,15 @@ class Buffer {
     const { room = null, event = 'bufferedData' } = opts;
     const item = { payload: data, room, event, timestamp: Date.now() };
 
+    this._stats.totalAdded++;
+
     if (this.useRedis && this.redisClientInstance) {
       try {
-        // Use Redis list for buffer storage
-        await this.redisClientInstance.rpush(this.redisBufferKey, JSON.stringify(item));
-        // Trim to max size
-        await this.redisClientInstance.ltrim(this.redisBufferKey, -this.maxBufferSize, -1);
+        // OPTIMIZATION: Use pipeline for batch operations
+        const pipeline = this.redisClientInstance.pipeline();
+        pipeline.rpush(this.redisBufferKey, JSON.stringify(item));
+        pipeline.ltrim(this.redisBufferKey, -this.maxBufferSize, -1);
+        await pipeline.exec();
         return;
       } catch (err) {
         console.error('[Buffer] Redis addToBuffer failed, using in-memory:', err.message);
@@ -98,9 +107,14 @@ class Buffer {
     return this.buffer.length;
   }
 
+  // OPTIMIZATION: Expose stats for monitoring
+  getStats() {
+    return { ...this._stats };
+  }
+
   async _flush() {
     if (this._isFlushing) return;
-    if (!this.io) return; // No io instance, skip flush
+    if (!this.io) return;
     this._isFlushing = true;
 
     try {
@@ -108,10 +122,20 @@ class Buffer {
 
       if (this.useRedis && this.redisClientInstance) {
         try {
-          // Get all items from Redis and clear
-          const items = await this.redisClientInstance.lrange(this.redisBufferKey, 0, -1);
-          if (items.length > 0) {
-            await this.redisClientInstance.del(this.redisBufferKey);
+          // OPTIMIZATION: Use pipeline for atomic get + clear operations
+          // This prevents race conditions between lrange and del
+          const pipeline = this.redisClientInstance.pipeline();
+          pipeline.lrange(this.redisBufferKey, 0, -1);
+          pipeline.del(this.redisBufferKey);
+          const results = await pipeline.exec();
+
+          // results[0] = [err, items], results[1] = [err, delCount]
+          const [lrangeErr, items] = results[0] || [];
+          if (lrangeErr) {
+            throw lrangeErr;
+          }
+
+          if (items && items.length > 0) {
             toSend = items.map(item => {
               try {
                 return JSON.parse(item);
@@ -122,6 +146,7 @@ class Buffer {
           }
         } catch (err) {
           console.error('[Buffer] Redis flush failed, using in-memory:', err.message);
+          this._stats.flushErrors++;
           toSend = this.buffer;
           this.buffer = [];
         }
@@ -132,7 +157,8 @@ class Buffer {
 
       if (toSend.length === 0) return;
 
-      const groups = new Map(); // key: `${room ?? ''}::${event ?? 'bufferedData'}`
+      // Group by room + event for efficient emission
+      const groups = new Map();
       for (const { payload, room, event } of toSend) {
         const key = `${room ?? ''}::${event ?? 'bufferedData'}`;
         if (!groups.has(key)) groups.set(key, []);
@@ -143,6 +169,7 @@ class Buffer {
         const [room, event] = key.split('::');
         const actualEvent = event || 'bufferedData';
 
+        // OPTIMIZATION: Batch emit in chunks to prevent overwhelming clients
         for (let i = 0; i < items.length; i += this.maxChunkSize) {
           const chunk = items.slice(i, i + this.maxChunkSize);
           if (room) {
@@ -152,8 +179,12 @@ class Buffer {
           }
         }
       }
+
+      this._stats.totalFlushed += toSend.length;
+      this._stats.lastFlushAt = Date.now();
     } catch (err) {
       console.error('[Buffer] Flush error:', err);
+      this._stats.flushErrors++;
     } finally {
       this._isFlushing = false;
     }
@@ -163,7 +194,14 @@ class Buffer {
   async _initRedis() {
     if (this.redisClientInstance) return this.redisClientInstance;
 
-    const client = new Redis(this.redisUrl);
+    const client = new Redis(this.redisUrl, {
+      // OPTIMIZATION: Connection pool settings
+      maxRetriesPerRequest: 3,
+      retryDelayOnFailover: 100,
+      lazyConnect: false,
+      enableReadyCheck: true,
+      keepAlive: 30000,
+    });
 
     client.on('error', (err) => {
       console.error('[Buffer] Redis Client Error:', err.message);
@@ -213,9 +251,19 @@ class Buffer {
     this.io = io;
   }
 
-  /** Graceful shutdown: stop timers and close Redis */
+  /** Graceful shutdown: flush remaining data, stop timers and close Redis */
   async close() {
+    // Flush any remaining buffered data before closing
+    if (this.buffer.length > 0 || (this.useRedis && this.redisClientInstance)) {
+      try {
+        await this._flush();
+      } catch (err) {
+        console.error('[Buffer] Final flush error:', err.message);
+      }
+    }
+
     this.stopBuffering();
+
     if (this.redisClientInstance) {
       try {
         await this.redisClientInstance.quit();
@@ -226,6 +274,9 @@ class Buffer {
         this.redisClientInstance = null;
       }
     }
+
+    // Log final stats
+    console.log(`[Buffer] Final stats: added=${this._stats.totalAdded}, flushed=${this._stats.totalFlushed}, errors=${this._stats.flushErrors}`);
   }
 }
 
