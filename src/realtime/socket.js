@@ -4,10 +4,31 @@ import Redis from 'ioredis'
 import jwt from 'jsonwebtoken'
 import { config } from '../config/app.config.js'
 
+// ==== OPTIMIZATION: Conditional logging based on environment ====
+const isDev = config.nodeEnv === 'development'
+const log = (...args) => isDev && console.log(...args)
+const logAlways = (...args) => console.log(...args) // For critical logs
+
+// ==== OPTIMIZATION: Event throttling configuration ====
+const CURSOR_THROTTLE_MS = 50 // Max 20 cursor updates/sec per client
+const VIEWPORT_THROTTLE_MS = 100 // Max 10 viewport updates/sec per client
+
+// ==== OPTIMIZATION: Connection limits ====
+const MAX_CONNECTIONS_PER_IP = 20
+const connectionsByIP = new Map()
+
+// ==== OPTIMIZATION: Room cleanup interval ====
+const ROOM_CLEANUP_INTERVAL_MS = 60000 // 1 minute
+const ROOM_HISTORY_TTL_MS = 30 * 60 * 1000 // 30 minutes
+
 export function initRealtimeServer(httpServer) {
   const io = new Server(httpServer, {
     cors: { origin: config.corsOrigins, credentials: true },
     path: '/socket.io',
+    // OPTIMIZATION: Connection settings for better performance
+    pingInterval: 25000,
+    pingTimeout: 20000,
+    maxHttpBufferSize: 1e6, // 1MB max message size
   })
 
   // Setup Redis adapter for horizontal scaling
@@ -18,24 +39,86 @@ export function initRealtimeServer(httpServer) {
 
       pubClient.on('error', (err) => console.error('[Socket.IO] Redis Pub Client Error:', err.message))
       subClient.on('error', (err) => console.error('[Socket.IO] Redis Sub Client Error:', err.message))
-      pubClient.on('connect', () => console.log('[Socket.IO] Redis adapter connected.'))
+      pubClient.on('connect', () => logAlways('[Socket.IO] Redis adapter connected.'))
 
       io.adapter(createAdapter(pubClient, subClient))
-      console.log('[Socket.IO] Redis adapter enabled for horizontal scaling.')
+      logAlways('[Socket.IO] Redis adapter enabled for horizontal scaling.')
     } catch (err) {
       console.warn('[Socket.IO] Redis adapter failed, using in-memory adapter:', err.message)
     }
   } else {
-    console.log('[Socket.IO] Using in-memory adapter (no Redis configured).')
+    logAlways('[Socket.IO] Using in-memory adapter (no Redis configured).')
   }
 
   const roomParticipants = new Map()
-
-  // History storage per room for undo/redo
-  // Each room has { past: [], future: [], currentSnapshot: null }
   const roomHistory = new Map()
+  const roomLastActivity = new Map() // Track last activity timestamp per room
   const MAX_HISTORY_SIZE = 50
 
+  // ==== OPTIMIZATION: Periodic cleanup for empty rooms and stale history ====
+  const cleanupInterval = setInterval(() => {
+    const now = Date.now()
+    let cleanedRooms = 0
+    let cleanedHistory = 0
+
+    // Clean up empty rooms
+    for (const [room, participants] of roomParticipants.entries()) {
+      if (participants.size === 0) {
+        roomParticipants.delete(room)
+        roomHistory.delete(room)
+        roomLastActivity.delete(room)
+        cleanedRooms++
+      }
+    }
+
+    // Clean up stale room history (rooms with no activity for TTL)
+    for (const [room, lastActive] of roomLastActivity.entries()) {
+      if (now - lastActive > ROOM_HISTORY_TTL_MS) {
+        if (!roomParticipants.has(room) || roomParticipants.get(room).size === 0) {
+          roomHistory.delete(room)
+          roomLastActivity.delete(room)
+          cleanedHistory++
+        }
+      }
+    }
+
+    if (cleanedRooms > 0 || cleanedHistory > 0) {
+      log(`[cleanup] Cleaned ${cleanedRooms} empty rooms, ${cleanedHistory} stale histories`)
+    }
+  }, ROOM_CLEANUP_INTERVAL_MS)
+
+  // Cleanup on server shutdown
+  io.on('close', () => {
+    clearInterval(cleanupInterval)
+  })
+
+  // ==== OPTIMIZATION: Rate limiting middleware ====
+  io.of('/realtime').use((socket, next) => {
+    const ip = socket.handshake.address || 'unknown'
+    const count = connectionsByIP.get(ip) || 0
+
+    if (count >= MAX_CONNECTIONS_PER_IP) {
+      log(`[rate-limit] Rejected connection from ${ip} (${count} connections)`)
+      return next(new Error('Too many connections from this IP'))
+    }
+
+    connectionsByIP.set(ip, count + 1)
+    socket.data.clientIP = ip
+
+    // Decrement on disconnect
+    socket.on('disconnect', () => {
+      const currentCount = connectionsByIP.get(ip) || 1
+      if (currentCount <= 1) {
+        connectionsByIP.delete(ip)
+      } else {
+        connectionsByIP.set(ip, currentCount - 1)
+      }
+    })
+
+    next()
+  })
+
+  // JWT authentication middleware
   io.of('/realtime').use((socket, next) => {
     try {
       const token = socket.handshake.auth?.token || socket.handshake.headers['authorization']?.replace('Bearer ', '')
@@ -55,9 +138,18 @@ export function initRealtimeServer(httpServer) {
     try {
       const origin = socket.handshake.headers?.origin || 'unknown'
       const uid = socket.data.user?.id || 'anonymous'
-      console.log(`[socket] connected id=${socket.id} origin=${origin} userId=${uid}`)
+      log(`[socket] connected id=${socket.id} origin=${origin} userId=${uid}`)
     } catch { }
+
+    // ==== OPTIMIZATION: Per-socket throttle trackers ====
+    const cursorThrottle = { lastSent: 0 }
+    const viewportThrottle = { lastSent: 0 }
     const lastSnapshotAtByRoom = new Map()
+
+    // Update room activity timestamp
+    const updateRoomActivity = (room) => {
+      if (room) roomLastActivity.set(room, Date.now())
+    }
 
     socket.on('mindmap:join', async (payload) => {
       try {
@@ -68,16 +160,15 @@ export function initRealtimeServer(httpServer) {
 
         // Support for user-based rooms (for AI streaming)
         if (mindmapId && mindmapId.startsWith('user:')) {
-          // User rooms don't need backend validation
-          // They're used for AI streaming events
           room = mindmapId
-          canEdit = false // User rooms are read-only for AI events
+          canEdit = false
           ok = true
           socket.join(room)
           socket.data.room = room
           socket.data.canEdit = canEdit
           socket.emit('mindmap:joined', { room, canEdit })
-          console.log(`[join] user-room=${room} id=${socket.id} (AI streaming)`)
+          updateRoomActivity(room)
+          log(`[join] user-room=${room} id=${socket.id} (AI streaming)`)
           return
         }
 
@@ -107,20 +198,22 @@ export function initRealtimeServer(httpServer) {
           }
         }
         if (!room) {
-          console.log(`[join] refused id=${socket.id} token=${shareToken ? 'public' : 'private'} mindmapId=${mindmapId}`)
+          log(`[join] refused id=${socket.id} token=${shareToken ? 'public' : 'private'} mindmapId=${mindmapId}`)
           return
         }
         socket.join(room)
         socket.data.room = room
         socket.data.canEdit = canEdit
         socket.emit('mindmap:joined', { room, canEdit })
-        console.log(`[join] room=${room} id=${socket.id} canEdit=${canEdit}`)
+        updateRoomActivity(room)
+        log(`[join] room=${room} id=${socket.id} canEdit=${canEdit}`)
+
         const participants = roomParticipants.get(room) || new Map()
         roomParticipants.set(room, participants)
         const snapshot = Array.from(participants.values())
         socket.emit('presence:state', snapshot)
       } catch (err) {
-        console.log(`[join:error] id=${socket.id} ${err?.message || err}`)
+        log(`[join:error] id=${socket.id} ${err?.message || err}`)
       }
     })
 
@@ -210,7 +303,7 @@ export function initRealtimeServer(httpServer) {
         })
         if (!res.ok) {
           const txt = await res.text()
-          console.log(`[history:log:error] id=${socket.id} action=${action} code=${res.status} msg=${txt}`)
+          log(`[history:log:error] id=${socket.id} action=${action} code=${res.status} msg=${txt}`)
           socket.emit('history:log:error', { mindmapId, action, code: res.status })
         }
         if (res.ok) {
@@ -230,7 +323,7 @@ export function initRealtimeServer(httpServer) {
           if (room) io.of('/realtime').to(room).emit('history:log', entry)
         }
       } catch (e) {
-        console.log(`[history:log:error] id=${socket.id} action=${action} msg=${e?.message || e}`)
+        log(`[history:log:error] id=${socket.id} action=${action} msg=${e?.message || e}`)
         socket.emit('history:log:error', { mindmapId: socket.data.mindmapId || null, action })
       }
     }
@@ -241,8 +334,9 @@ export function initRealtimeServer(httpServer) {
         const historyId = payload?.historyId || null
         io.of('/realtime').to(room).emit('history:restore', { historyId, snapshot })
         logHistory('restore', { targetHistoryId: historyId }, snapshot)
+        updateRoomActivity(room)
       } catch (e) {
-        console.log(`[history:restore:error] id=${socket.id} ${e?.message || e}`)
+        log(`[history:restore:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
@@ -250,6 +344,7 @@ export function initRealtimeServer(httpServer) {
 
     socket.on('mindmap:nodes:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:nodes:change', changes)
+      updateRoomActivity(room)
       try {
         if (!room || !Array.isArray(changes)) return
         const trackers = dragStateByRoom.get(room) || new Map()
@@ -274,28 +369,45 @@ export function initRealtimeServer(httpServer) {
         }
       } catch (_) { }
     })
+
     socket.on('mindmap:edges:change', (room, changes) => {
       socket.broadcast.to(room).emit('mindmap:edges:change', changes)
       logHistory('edge_update', changes)
+      updateRoomActivity(room)
     })
+
     socket.on('mindmap:connect', (room, connection) => {
       socket.broadcast.to(room).emit('mindmap:connect', connection)
       logHistory('edge_add', connection)
+      updateRoomActivity(room)
     })
+
+    // ==== OPTIMIZATION: Throttled viewport updates ====
     socket.on('mindmap:viewport', (room, viewport) => {
+      const now = Date.now()
+      if (now - viewportThrottle.lastSent < VIEWPORT_THROTTLE_MS) return
+      viewportThrottle.lastSent = now
       socket.broadcast.to(room).emit('mindmap:viewport', viewport)
     })
 
     socket.on('mindmap:nodes:update', (room, node) => {
       socket.broadcast.to(room).emit('mindmap:nodes:update', node)
       logHistory('node_update', node)
+      updateRoomActivity(room)
     })
+
     socket.on('mindmap:edges:update', (room, edge) => {
       socket.broadcast.to(room).emit('mindmap:edges:update', edge)
       logHistory('edge_update', edge)
+      updateRoomActivity(room)
     })
 
+    // ==== OPTIMIZATION: Throttled cursor updates ====
     socket.on('cursor:move', (room, data) => {
+      const now = Date.now()
+      if (now - cursorThrottle.lastSent < CURSOR_THROTTLE_MS) return
+      cursorThrottle.lastSent = now
+
       const participants = roomParticipants.get(room)
       if (participants) {
         const p = participants.get(socket.id)
@@ -324,8 +436,9 @@ export function initRealtimeServer(httpServer) {
         cursor: existing.cursor || null,
         active: existing.active || null,
       })
-      console.log(`[presence] announce clientId=${clientId} userId=${userId} name=${name}`)
+      log(`[presence] announce clientId=${clientId} userId=${userId} name=${name}`)
       socket.broadcast.to(room).emit('presence:announce', { clientId, userId, name, color, avatar })
+      updateRoomActivity(room)
     })
 
     socket.on('presence:active', (room, data) => {
@@ -336,7 +449,7 @@ export function initRealtimeServer(httpServer) {
           p.active = data || null
         }
       }
-      console.log(`[presence] active clientId=${socket.id} type=${data?.type || 'none'} id=${data?.id || ''}`)
+      log(`[presence] active clientId=${socket.id} type=${data?.type || 'none'} id=${data?.id || ''}`)
       socket.broadcast.to(room).emit('presence:active', { clientId: socket.id, active: data || null })
     })
 
@@ -348,7 +461,7 @@ export function initRealtimeServer(httpServer) {
           p.active = null
         }
       }
-      console.log(`[presence] clear clientId=${socket.id}`)
+      log(`[presence] clear clientId=${socket.id}`)
       socket.broadcast.to(room).emit('presence:clear', { clientId: socket.id })
     })
 
@@ -373,8 +486,9 @@ export function initRealtimeServer(httpServer) {
           createdAt: new Date().toISOString(),
         }
         io.of('/realtime').to(r).emit('chat:message', msg)
+        updateRoomActivity(r)
       } catch (e) {
-        console.log(`[chat:error] id=${socket.id} ${e?.message || e}`)
+        log(`[chat:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
@@ -397,11 +511,10 @@ export function initRealtimeServer(httpServer) {
         }
         io.of('/realtime').to(r).emit('chat:typing', data)
       } catch (e) {
-        console.log(`[chat:typing:error] id=${socket.id} ${e?.message || e}`)
+        log(`[chat:typing:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
-    // Handle auto-save mode sync - broadcast to all clients in room
     socket.on('autosave:toggle', (room, payload) => {
       try {
         const r = room || socket.data.room
@@ -413,15 +526,14 @@ export function initRealtimeServer(httpServer) {
           userId: socket.data.user?.id || null,
           at: Date.now(),
         })
-        console.log(`[autosave] room=${r} enabled=${enabled} by clientId=${socket.id}`)
+        log(`[autosave] room=${r} enabled=${enabled} by clientId=${socket.id}`)
       } catch (e) {
-        console.log(`[autosave:error] id=${socket.id} ${e?.message || e}`)
+        log(`[autosave:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
     // ===== REALTIME UNDO/REDO SYSTEM =====
 
-    // Helper: Get or create history for a room
     const getOrCreateRoomHistory = (room) => {
       if (!roomHistory.has(room)) {
         roomHistory.set(room, { past: [], future: [], currentSnapshot: null })
@@ -429,7 +541,6 @@ export function initRealtimeServer(httpServer) {
       return roomHistory.get(room)
     }
 
-    // Handle snapshot recording before changes
     socket.on('mindmap:snapshot', (room, payload) => {
       try {
         const r = room || socket.data.room
@@ -440,34 +551,28 @@ export function initRealtimeServer(httpServer) {
 
         if (!snapshot) return
 
-        // Save current state to past before applying new change
         if (history.currentSnapshot) {
           history.past.push(history.currentSnapshot)
-          // Limit history size
           if (history.past.length > MAX_HISTORY_SIZE) {
             history.past.shift()
           }
         }
 
-        // Clear future (new action invalidates redo)
         history.future = []
-
-        // Update current snapshot
         history.currentSnapshot = snapshot
 
-        // Broadcast canUndo/canRedo state to all clients
         io.of('/realtime').to(r).emit('history:state', {
           canUndo: history.past.length > 0,
           canRedo: history.future.length > 0,
         })
 
-        console.log(`[snapshot] room=${r} past=${history.past.length} future=${history.future.length}`)
+        updateRoomActivity(r)
+        log(`[snapshot] room=${r} past=${history.past.length} future=${history.future.length}`)
       } catch (e) {
-        console.log(`[snapshot:error] id=${socket.id} ${e?.message || e}`)
+        log(`[snapshot:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
-    // Handle undo request
     socket.on('undo:request', (room) => {
       try {
         const r = room || socket.data.room
@@ -480,16 +585,13 @@ export function initRealtimeServer(httpServer) {
           return
         }
 
-        // Push current to future
         if (history.currentSnapshot) {
           history.future.push(history.currentSnapshot)
         }
 
-        // Pop from past
         const previousSnapshot = history.past.pop()
         history.currentSnapshot = previousSnapshot
 
-        // Broadcast restored state to ALL clients in room
         io.of('/realtime').to(r).emit('undo:result', {
           success: true,
           snapshot: previousSnapshot,
@@ -498,14 +600,14 @@ export function initRealtimeServer(httpServer) {
           clientId: socket.id,
         })
 
-        console.log(`[undo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
+        updateRoomActivity(r)
+        log(`[undo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
       } catch (e) {
-        console.log(`[undo:error] id=${socket.id} ${e?.message || e}`)
+        log(`[undo:error] id=${socket.id} ${e?.message || e}`)
         socket.emit('undo:result', { success: false, reason: e?.message || 'Undo failed' })
       }
     })
 
-    // Handle redo request
     socket.on('redo:request', (room) => {
       try {
         const r = room || socket.data.room
@@ -518,16 +620,13 @@ export function initRealtimeServer(httpServer) {
           return
         }
 
-        // Push current to past
         if (history.currentSnapshot) {
           history.past.push(history.currentSnapshot)
         }
 
-        // Pop from future
         const nextSnapshot = history.future.pop()
         history.currentSnapshot = nextSnapshot
 
-        // Broadcast restored state to ALL clients in room
         io.of('/realtime').to(r).emit('redo:result', {
           success: true,
           snapshot: nextSnapshot,
@@ -536,9 +635,10 @@ export function initRealtimeServer(httpServer) {
           clientId: socket.id,
         })
 
-        console.log(`[redo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
+        updateRoomActivity(r)
+        log(`[redo] room=${r} past=${history.past.length} future=${history.future.length} by clientId=${socket.id}`)
       } catch (e) {
-        console.log(`[redo:error] id=${socket.id} ${e?.message || e}`)
+        log(`[redo:error] id=${socket.id} ${e?.message || e}`)
         socket.emit('redo:result', { success: false, reason: e?.message || 'Redo failed' })
       }
     })
@@ -555,7 +655,7 @@ export function initRealtimeServer(httpServer) {
           at: Date.now(),
         })
       } catch (e) {
-        console.log(`[undo:performed:error] id=${socket.id} ${e?.message || e}`)
+        log(`[undo:performed:error] id=${socket.id} ${e?.message || e}`)
       }
     })
 
@@ -570,10 +670,9 @@ export function initRealtimeServer(httpServer) {
           at: Date.now(),
         })
       } catch (e) {
-        console.log(`[redo:performed:error] id=${socket.id} ${e?.message || e}`)
+        log(`[redo:performed:error] id=${socket.id} ${e?.message || e}`)
       }
     })
-
 
     socket.on('disconnect', () => {
       const room = socket.data.room
@@ -582,14 +681,21 @@ export function initRealtimeServer(httpServer) {
       if (!participants) return
       if (participants.has(socket.id)) {
         participants.delete(socket.id)
-        console.log(`[socket] disconnected id=${socket.id} room=${room}`)
+        log(`[socket] disconnected id=${socket.id} room=${room}`)
         socket.broadcast.to(room).emit('presence:left', { clientId: socket.id })
+
+        // ==== OPTIMIZATION: Clean up room if empty ====
+        if (participants.size === 0) {
+          log(`[cleanup] Room ${room} is now empty, scheduling cleanup`)
+          // Don't delete immediately - let the periodic cleanup handle it
+          // This allows for brief reconnections
+        }
       }
     })
   })
 
   globalThis.realtimeIO = io
-  return io  // Return the io instance for sharing with Buffer
+  return io
 }
 
 export default initRealtimeServer
